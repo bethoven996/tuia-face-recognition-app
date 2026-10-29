@@ -8,9 +8,11 @@ import cv2
 import numpy as np
 import torch
 import onnxruntime
+from insightface import model_zoo
+from insightface.utils import face_align
 from lib.schemas import EmbeddingRecord, FaceDetection, PredictResult, AlignedFace
 from lib.storage.base import EmbeddingStoreProtocol
-import os 
+import os
 import logging
 
 logger = logging.getLogger(__name__)
@@ -28,6 +30,7 @@ class FaceService:
         detector_path: Path | None = None,
         det_score_threshold: float = 0.5,
         det_input_size: int = 640,
+        det_pad: float = 0.5,
         min_face_size: int = 20,
         align_margin: float = 0.5,
     ) -> None:
@@ -39,6 +42,7 @@ class FaceService:
         self.output_path = output_path
         self.det_score_threshold = det_score_threshold
         self.det_input_size = det_input_size
+        self.det_pad = det_pad
         self.min_face_size = min_face_size
         self.align_margin = align_margin
         self.detector: any = self._load_detector(detector_path)
@@ -90,7 +94,13 @@ class FaceService:
         """
         if detector_path is None:
             return None
-        return self._load_model(detector_path)
+        detector = model_zoo.get_model(str(detector_path))
+        detector.prepare(
+            ctx_id=-1,
+            input_size=(self.det_input_size, self.det_input_size),
+            det_thresh=self.det_score_threshold,
+        )
+        return detector
 
     def _load_image(self, source_path: str) -> np.ndarray:
         image = cv2.imread(source_path)
@@ -98,7 +108,7 @@ class FaceService:
             raise ValueError(f"Could not read image: {source_path}")
         # BGR uint8 (InsightFace / OpenCV convention)
         return image
-    
+
     @staticmethod
     def _iou(a: np.ndarray, b: np.ndarray) -> float:
         """Intersection over union between two boxes (x1, y1, x2, y2)."""
@@ -107,31 +117,74 @@ class FaceService:
         inter = max(0.0, ix2 - ix1) * max(0.0, iy2 - iy1)
         union = (a[2] - a[0]) * (a[3] - a[1]) + (b[2] - b[0]) * (b[3] - b[1]) - inter
         return float(inter / union) if union > 0 else 0.0
-    
+
+    def _detectar(self, image: np.ndarray, pad: float):
+        """Igual a la función detectar() de la notebook 1: agrega un borde, detecta y corrige las coordenadas."""
+        h, w = image.shape[:2]
+        py, px = int(h * pad), int(w * pad)
+        img_pad = cv2.copyMakeBorder(image, py, py, px, px, cv2.BORDER_CONSTANT, value=(0, 0, 0))
+        bboxes, kpss = self.detector.detect(img_pad)
+        bboxes[:, [0, 2]] -= px
+        bboxes[:, [1, 3]] -= py
+        kpss[:, :, 0] -= px
+        kpss[:, :, 1] -= py
+        return bboxes, kpss
+
     def detect_faces(self, image: np.ndarray) -> list[tuple[int, int, int, int]]:
         """
         Each box is (x1, y1, x2, y2) in pixels (InsightFace convention).
         Return a list of tuples with the coordinates of the faces detected in the image.
         """
-        raise NotImplementedError("Not implemented")
-
+        h, w = image.shape[:2]
+        bboxes, _ = self._detectar(image, self.det_pad)
+        cajas = []
+        for x1, y1, x2, y2, score in bboxes:
+            if min(x2 - x1, y2 - y1) < self.min_face_size:
+                continue
+            cajas.append(self._clip_xyxy(int(x1), int(y1), int(x2), int(y2), h, w))
+        return cajas
 
     def align_face(
         self, image: np.ndarray, box: tuple[int, int, int, int]
     ) -> AlignedFace:
         """
-        Crop using box (x1, y1, x2, y2) and run FaceAnalysis on the crop.
-        Return an AlignedFace object.
+        Recorta alrededor de la caja con margen (ALIGN_MARGIN), busca los 5 landmarks
+        en ese recorte y alinea la cara con norm_crop, igual que en la notebook 1.
         """
-        raise NotImplementedError("Not implemented")
+        x1, y1, x2, y2 = box
+        h, w = image.shape[:2]
+        mx = int((x2 - x1) * self.align_margin)
+        my = int((y2 - y1) * self.align_margin)
+        cx1, cy1 = max(0, x1 - mx), max(0, y1 - my)
+        cx2, cy2 = min(w, x2 + mx), min(h, y2 + my)
+        recorte = image[cy1:cy2, cx1:cx2]
+
+        bboxes, kpss = self._detectar(recorte, self.det_pad)
+        if len(bboxes) == 0:
+            raise ValueError("No se encontraron los landmarks de la cara.")
+        areas = (bboxes[:, 2] - bboxes[:, 0]) * (bboxes[:, 3] - bboxes[:, 1])
+        kps = kpss[np.argmax(areas)] + np.array([cx1, cy1])
+
+        alineada = face_align.norm_crop(image, landmark=kps, image_size=self.face_size)
+        return AlignedFace(
+            bbox=box,
+            keypoints=kps - np.array([x1, y1]),
+            image=alineada,
+        )
 
     def extract_embedding_from_face(self, face: AlignedFace) -> list[float]:
         """
-        Extract embedding from face.
-        Return a list of floats representing the embedding of the face.
+        Mismo preprocesamiento que en el entrenamiento: BGR -> RGB, (x - 127.5) / 127.5,
+        HWC -> CHW y dimensión de lote. Devuelve el embedding normalizado (L2).
         """
-        raise NotImplementedError("Not implemented")
-        
+        img = cv2.cvtColor(face.image, cv2.COLOR_BGR2RGB).astype(np.float32)
+        img = (img - 127.5) / 127.5
+        tensor = img.transpose(2, 0, 1)[np.newaxis, ...]
+        nombre_entrada = self.model.get_inputs()[0].name
+        emb = self.model.run(None, {nombre_entrada: tensor})[0][0]
+        emb = emb / np.linalg.norm(emb)
+        return emb.astype(float).tolist()
+
     def _cosine(self, a: np.ndarray, b: np.ndarray) -> float:
         denom = np.linalg.norm(a) * np.linalg.norm(b)
         if denom == 0:
