@@ -38,7 +38,7 @@ tuia-face-recognition-app/
 │       ├── config.py            # Configuración vía .env
 │       ├── schemas.py
 │       ├── services/
-│       │   ├── face_service.py  # ⚠️ Funciones a implementar
+│       │   ├── face_service.py  #
 │       │   └── task_manager.py
 │       └── storage/
 │           ├── base.py
@@ -71,7 +71,7 @@ Recordá actualizar la configuración del `.env` correspondiente (`MODEL_NAME`, 
 
 Con docker compose, el entorno reinicia la aplicación y actualiza el código automáticamente al detectar cambios. Lo mismo ocurre en local si usan `--reload`.
 
-El reinicio automático puede no funcionar en algunas versiones de Docker Desktop para *Windows*. En ese caso, vuelvan a correr los comandos del siguiente apartado para actualizar el código dentro de Docker.
+El reinicio automático puede no funcionar en algunas versiones de Docker Desktop para _Windows_. En ese caso, vuelvan a correr los comandos del siguiente apartado para actualizar el código dentro de Docker.
 
 ## Opción 1 - Corriendo dentro de Docker
 
@@ -135,7 +135,7 @@ uvicorn frontend.app:app --port 8080
 
 ### 7. Iniciá el backend
 
-Ajustá el archivo *.env.local.example* a tus necesidades. Desde la carpeta `src`, en otra terminal:
+Ajustá el archivo _.env.local.example_ a tus necesidades. Desde la carpeta `src`, en otra terminal:
 
 ```bash
 cp ../models/<NOMBRE_DE_TU_MODELO> models/
@@ -160,6 +160,8 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 
 ## Pipeline
 
+## Pipeline
+
 ### Provisto por la cátedra
 
 - API asincrónica (`/upload`, `/insert`, `/predict`, `/status`) y manejo de jobs.
@@ -169,37 +171,59 @@ No hardcodeen parámetros: configúrenlos mediante `.env`.
 - Persistencia configurable en JSON o en PostgreSQL + pgvector (`USE_PGVECTOR`).
 - Frontend para registrar identidades, predecir y visualizar los resultados (cajas, etiquetas y keypoints).
 
-### A implementar por el grupo (`src/lib/services/face_service.py`)
+### Implementado por el grupo (`src/lib/services/face_service.py`)
 
-Estas funciones hoy lanzan `NotImplementedError`:
+1. `detect_faces`: detector SCRFD (`det_10g.onnx`) con un borde configurable (`DET_PAD`) alrededor de la imagen. Filtra por score (`DET_SCORE_THRESHOLD`) y por tamaño mínimo (`MIN_FACE_SIZE`).
+2. `align_face`: recorta alrededor de la caja con margen (`ALIGN_MARGIN`), busca los 5 landmarks y alinea con `norm_crop` a `FACE_SIZE`. Devuelve los keypoints relativos a la caja.
+3. `extract_embedding_from_face`: ArcFace (`w600k_r50.onnx`) con el mismo preprocesamiento que en las notebooks (BGR→RGB, (x−127,5)/127,5, HWC→CHW). Devuelve el embedding normalizado (L2).
 
-1. `detect_faces`: detección de rostros. Devuelve las cajas `(x1, y1, x2, y2)`.
-2. `align_face`: alineación con landmarks y normalización a `FACE_SIZE`. Devuelve un `AlignedFace`.
-3. `extract_embedding_from_face`: extracción del embedding de dimensión `EMBEDDING_DIM`, normalizado L2.
-
-Ver detalles y recomendaciones en [ENUNCIADO.md](ENUNCIADO.md#4-parte-3--integración-en-la-aplicación).
+Se agregó la variable `DET_PAD` en `config.py`, `api.py` y los `.env.*.example`, para que el borde del detector sea configurable.
 
 ## Modelo y fine-tuning
 
-Completar en la entrega final:
+**Modelo elegido:** ArcFace preentrenado de InsightFace (paquete `buffalo_l`), usado sin reentrenar.
 
-- Modelo elegido y link público de descarga
-- Arquitectura (ResNet, EfficientNet, ViT, CNN custom, etc.)
-- Justificación técnica y trade-offs frente al modelo descartado
-- Hiperparámetros y proceso de entrenamiento / fine-tuning
-- Umbral de similitud elegido y cómo se calibró
-- Análisis de errores (FP/FN)
-- Métricas: accuracy, precision, recall, AUC/EER
+- **Reconocedor:** `w600k_r50.onnx`, una ResNet-50 entrenada con la loss ArcFace sobre WebFace600K. Recibe caras alineadas de 112×112 y devuelve embeddings de 512 valores.
+- **Detector:** `det_10g.onnx` (SCRFD), que devuelve la caja y los 5 landmarks de cada cara.
+- **Descarga (link público):** https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip. Del zip se usan solo `w600k_r50.onnx` y `det_10g.onnx`, que van en la carpeta `models/`.
+- **Licencia:** los modelos de InsightFace son solo para uso no comercial o de investigación.
+
+**Modelo descartado:** una CNN propia de 4 bloques convolucionales (433 mil parámetros, embedding de 128), entrenada desde cero con clasificación + embedding sobre 85 personas. Hiperparámetros: Adam (lr 0,001, weight decay 1e-4), ReduceLROnPlateau, batch 64, 30 épocas con early stopping (paciencia 5) y augmentation con albumentations. El detalle está en `2-train.ipynb`.
+
+**Comparación (test con personas no vistas):**
+
+| Métrica                         | CNN propia            | ArcFace               |
+| ------------------------------- | --------------------- | --------------------- |
+| AUC (verificación)              | 0,850                 | 1,000                 |
+| EER                             | 0,236                 | 0,002                 |
+| TAR @ FAR=1e-3                  | 0,051                 | 0,997                 |
+| Top-1 accuracy                  | 0,433                 | 0,999                 |
+| Precision / Recall / F1 (macro) | 0,440 / 0,051 / 0,084 | 1,000 / 0,993 / 0,996 |
+| Desconocidos rechazados         | 0,975                 | 0,999                 |
+| Tiempo por cara en CPU          | 9 ms                  | 104 ms                |
+| Tamaño                          | 1,7 MB                | 174 MB                |
+
+**Justificación:** ArcFace es muy superior en todas las métricas, y su costo (104 ms por cara en CPU) es aceptable para la app. La CNN rinde mucho menos porque la entrenamos con pocas identidades y pocas imágenes, es 100 veces más chica, usa una loss de clasificación que no fuerza a separar bien los embeddings, y no terminó de converger en 30 épocas en CPU. Es probable que algunas celebridades de Pins estuvieran en los datos de entrenamiento de ArcFace, así que sus resultados pueden estar algo inflados.
+
+**Umbral:** `SIMILARITY_THRESHOLD=0.33` con métrica coseno. Lo calibramos con validación, simulando la identificación: es el umbral más bajo que rechaza al 99% de las personas no registradas. Con él, en test se identificó correctamente al 99,3% de las personas registradas y se rechazó al 99,9% de las desconocidas.
+
+**Análisis de errores:** los pocos errores de ArcFace se deben a diferencias grandes de edad (fotos de la infancia), condiciones extremas (blanco y negro, anteojos oscuros, ojos cerrados), oclusiones (máscaras) y una ilustración que se había colado en el dataset.
 
 ## Dataset
 
-Documentar:
+- **Fuente:** Pins Face Recognition (Kaggle), fotos de 105 celebridades sacadas de Pinterest. Licencia: \_\_\_\_. Se usó solo con fines académicos y no se incluye en el repositorio.
+- **Tamaño original:** 17.499 imágenes, entre 86 y 237 por persona (media 167), con un desbalance moderado.
+- **Variaciones:** mucha variación de iluminación, pose y expresión; algunas fotos en blanco y negro, con maquillaje de personaje o con oclusiones.
+- **Detección y alineación:** SCRFD con un borde del 50% alrededor de la imagen (sin ese borde el detector fallaba en el 90% de los casos, porque las fotos ya vienen recortadas alrededor de la cara) y alineación con los 5 landmarks (`norm_crop`) a 112×112.
+- **Filtrado:** imágenes corruptas, sin cara o con más de una, caras chicas, borrosas (varianza del Laplaciano), con exposición extrema, duplicados y casi-duplicados (dHash), posibles errores de etiquetado (similitud baja con su propia identidad) y casi-duplicados entre train y test (similitud > 0,95).
+- **Resultado final:** 16.650 caras alineadas.
 
-- Fuente de las imágenes (propias y/o públicas) y su licencia
-- Cantidad por clase/persona
-- Balance de clases
-- Variaciones (iluminación, pose, expresión)
-- Reglas de filtrado y calidad
+| Split                          | Personas | Imágenes |
+| ------------------------------ | -------- | -------- |
+| train                          | 85       | 9.581    |
+| val                            | 85       | 1.978    |
+| test_closed                    | 85       | 1.986    |
+| test_open (personas no vistas) | 20       | 3.105    |
 
 ## Notas importantes
 
